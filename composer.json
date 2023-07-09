@@ -1,0 +1,21 @@
+{
+  "name": "inisire/fibers-mqtt",
+  "minimum-stability": "dev",
+  "prefer-stable": true,
+  "require": {
+    "php": ">=8.1",
+    "inisire/fibers": "dev-master",
+    "binsoul/net-mqtt": "^0.8"
+  },
+  "repositories": [
+    {
+      "type": "vcs",
+      "url": "https://github.com/inisire/fibers"
+    }
+  ],
+  "autoload": {
+    "psr-4": {
+      "inisire\\fibers\\": "src/"
+    }
+  }
+}

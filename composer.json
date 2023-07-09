@@ -15,7 +15,7 @@
   ],
   "autoload": {
     "psr-4": {
-      "inisire\\fibers\\": "src/"
+      "inisire\\mqtt\\": "src/"
     }
   }
 }

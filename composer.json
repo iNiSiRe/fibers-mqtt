@@ -1,5 +1,6 @@
 {
   "name": "inisire/fibers-mqtt",
+  "keywords": ["php", "fibers", "mqtt"],
   "minimum-stability": "dev",
   "prefer-stable": true,
   "require": {

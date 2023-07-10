@@ -6,7 +6,9 @@ use BinSoul\Net\Mqtt as MQTT;
 use inisire\fibers\Broadcast;
 use inisire\fibers\Contract\SocketFactory;
 use inisire\fibers\Network\Socket;
+use inisire\fibers\Promise;
 use inisire\fibers\Scheduler;
+use inisire\mqtt\Contract\MessageHandler;
 use Psr\Log\LoggerInterface;
 
 
@@ -22,7 +24,15 @@ class Connection
 
     private ?Socket $socket = null;
 
-    private Broadcast $inbound;
+    /**
+     * @var array<MessageHandler>
+     */
+    private array $messageHandlers = [];
+
+    /**
+     * @var array<MQTT\Flow>
+     */
+    private array $flows = [];
 
     public function __construct(
         private readonly LoggerInterface $logger,
@@ -32,7 +42,6 @@ class Connection
         $this->factory = new MQTT\DefaultPacketFactory();
         $this->buffer = new MQTT\PacketStream();
         $this->identifierGenerator = new MQTT\DefaultIdentifierGenerator();
-        $this->inbound = new Broadcast();
     }
 
     public function connect(string $host, int $port = 1883, int $timeout = 5): bool
@@ -47,91 +56,63 @@ class Connection
             while ($this->socket->isConnected()) {
                 foreach ($this->read() as $packet) {
                     $this->onPacketReceived($packet);
-                    $this->inbound->write($packet);
                 }
             }
-            $this->inbound->close();
-
-            $this->logger->debug('Disconnected');
         });
 
         $connection = new MQTT\DefaultConnection();
-
-        $request = new MQTT\Packet\ConnectRequestPacket();
-        $request->setProtocolLevel($connection->getProtocol());
-        $request->setKeepAlive($connection->getKeepAlive());
-        $request->setClientID($connection->getClientID());
-        $request->setCleanSession($connection->isCleanSession());
-        $request->setUsername($connection->getUsername());
-        $request->setPassword($connection->getPassword());
-
-        $will = $connection->getWill();
-        if ($will !== null && $will->getTopic() !== '' && $will->getPayload() !== '') {
-            $request->setWill($will->getTopic(), $will->getPayload(), $will->getQosLevel(), $will->isRetained());
-        }
-
-        $this->send($request);
-
-        foreach ($this->inboundPackets() as $packet) {
-            if ($packet->getPacketType() === MQTT\Packet::TYPE_CONNACK) {
-                $this->connected = true;
-                break;
-            }
-        }
+        $flow = new Flow(new MQTT\Flow\OutgoingConnectFlow($this->factory, $connection, $this->identifierGenerator), new Promise());
+        $this->flows[] = $flow;
+        $this->send($flow->start());
+        $this->connected = $flow->await(new Promise\Timeout($timeout, false));
 
         Scheduler::async(function () use ($connection) {
-            while ($this->connected) {
+            while ($this->isConnected()) {
                 Scheduler::sleep(floor($connection->getKeepAlive() * 0.75));
                 $this->send(new MQTT\Packet\PingRequestPacket());
             }
         });
 
-        $this->logger->debug('Connection: ' . $this->connected ? 'connected' : 'not connected');
+        $this->logger->debug(sprintf('Connection: %s', $this->connected ? 'connected' : 'not connected'));
 
         return $this->connected;
     }
 
-    public function subscribe(string $topic, int $qos = 0): bool
+    public function registerMessageHandler(MessageHandler $handler): void
     {
-        $request = new MQTT\Packet\SubscribeRequestPacket();
-        $request->setTopic($topic);
-        $request->setQosLevel($qos);
-        $request->setIdentifier($this->identifierGenerator->generatePacketIdentifier());
-
-        $this->send($request);
-
-        $subscribed = false;
-        foreach ($this->inboundPackets() as $packet) {
-            if ($packet instanceof MQTT\Packet\SubscribeResponsePacket && $packet->getIdentifier() === $request->getIdentifier()) {
-                $subscribed = true;
-                break;
-            }
-        }
-
-        $this->logger->debug('Subscribe: ' . $subscribed ? 'subscribed' : 'not subscribed');
-
-        return $subscribed;
-    }
-
-    private function inboundPackets(): iterable
-    {
-        $packets = $this->inbound->attach(new \inisire\fibers\Channel());
-
-        return $packets->iterate();
+        $this->messageHandlers[] = $handler;
     }
 
     /**
-     * @return iterable<MQTT\Message>
+     * @return iterable<MessageHandler>
      */
-    public function messages(): iterable
+    public function getMessageHandlers(): iterable
     {
-        $packets = $this->inbound->attach(new \inisire\fibers\Channel());
-
-        foreach ($packets->iterate() as $packet) {
-            if ($packet instanceof MQTT\Packet\PublishRequestPacket) {
-                yield new MQTT\DefaultMessage($packet->getTopic(), $packet->getPayload(), $packet->getQosLevel(), $packet->isRetained(), $packet->isDuplicate());
-            }
+        foreach ($this->messageHandlers as $handler) {
+            yield $handler;
         }
+    }
+    
+    public function subscribe(MQTT\Subscription $subscription): bool
+    {
+        $flow = new Flow(new MQTT\Flow\OutgoingSubscribeFlow($this->factory, [$subscription], $this->identifierGenerator), new Promise());
+        $this->flows[] = $flow;
+        $this->send($flow->start());
+        $subscribed = $flow->await(new Promise\Timeout(5.0, false));
+
+        $this->logger->debug(sprintf('Subscribe: %s to topic=%s', $subscribed ? 'subscribed' : 'not subscribed', $subscription->getFilter()));
+
+        return $subscribed;
+    }
+    
+    public function publish(MQTT\Message $message): bool
+    {
+        $flow = new Flow(new MQTT\Flow\OutgoingPublishFlow($this->factory, $message, $this->identifierGenerator), new Promise());
+        $this->flows[] = $flow;
+        $this->send($flow->start());
+        $published = $flow->await(new Promise\Timeout(5.0, false));
+        
+        return $published;
     }
 
     public function send(MQTT\Packet $packet): false|int
@@ -141,21 +122,36 @@ class Connection
 
     private function onPacketReceived(MQTT\Packet $packet): void
     {
+        echo 'Flows: ' . count($this->flows) . PHP_EOL;
+
+        foreach ($this->flows as $id => $flow) {
+            if ($flow->accept($packet)) {
+                if ($next = $flow->next($packet)) {
+                    $this->send($next);
+                }
+            }
+
+            if ($flow->isFinished()) {
+                unset($this->flows[$id]);
+            }
+        }
+
         switch ($packet->getPacketType()) {
             case MQTT\Packet::TYPE_PUBLISH: {
                 if (!$packet instanceof MQTT\Packet\PublishRequestPacket) {
                     break;
                 }
 
-                $response = match ($packet->getQosLevel()) {
-                    0 => null,
-                    1 => new MQTT\Packet\PublishAckPacket(),
-                    2 => new MQTT\Packet\PublishReceivedPacket()
-                };
+                $message = new MQTT\DefaultMessage(
+                    $packet->getTopic(),
+                    $packet->getPayload(),
+                    $packet->getQosLevel(),
+                    $packet->isRetained(),
+                    $packet->isDuplicate()
+                );
 
-                if ($response) {
-                    $response->setIdentifier($packet->getIdentifier());
-                    $this->send($response);
+                foreach ($this->getMessageHandlers() as $handler) {
+                    $handler->handleMessage($message);
                 }
 
                 break;
@@ -214,10 +210,16 @@ class Connection
     public function close()
     {
         $this->connected = false;
-
+        $this->flows = [];
+        
         if ($this->socket->isConnected()) {
             $this->socket->close();
         }
+    }
+    
+    public function isConnected(): bool
+    {
+        return $this->connected;
     }
 
     public function __destruct()

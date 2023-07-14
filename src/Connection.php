@@ -3,17 +3,22 @@
 namespace inisire\mqtt;
 
 use BinSoul\Net\Mqtt as MQTT;
+use Evenement\EventEmitterInterface;
+use Evenement\EventEmitterTrait;
 use inisire\fibers\Broadcast;
 use inisire\fibers\Contract\SocketFactory;
 use inisire\fibers\Network\Socket;
 use inisire\fibers\Promise;
 use inisire\fibers\Scheduler;
 use inisire\mqtt\Contract\MessageHandler;
+use inisire\Protocol\MiIO\Contract\Packet;
 use Psr\Log\LoggerInterface;
 
 
-class Connection
+class Connection implements EventEmitterInterface
 {
+    use EventEmitterTrait;
+
     private MQTT\PacketFactory $factory;
 
     private MQTT\PacketIdentifierGenerator $identifierGenerator;
@@ -46,6 +51,8 @@ class Connection
 
     public function connect(string $host, int $port = 1883, int $timeout = 5): bool
     {
+        $this->logger->debug('Connection: in progress');
+
         $this->socket = $this->socketFactory->createTCP();
 
         if (!$this->socket->connect($host, $port, $timeout)) {
@@ -58,6 +65,7 @@ class Connection
                     $this->onPacketReceived($packet);
                 }
             }
+            $this->close();
         });
 
         $connection = new MQTT\DefaultConnection();
@@ -95,34 +103,51 @@ class Connection
     
     public function subscribe(MQTT\Subscription $subscription): bool
     {
+        $this->logger->debug('Subscribe', ['filter' => $subscription->getFilter()]);
+
         $flow = new Flow(new MQTT\Flow\OutgoingSubscribeFlow($this->factory, [$subscription], $this->identifierGenerator), new Promise());
         $this->flows[] = $flow;
         $this->send($flow->start());
         $subscribed = $flow->await(new Promise\Timeout(5.0, false));
 
-        $this->logger->debug(sprintf('Subscribe: %s to topic=%s', $subscribed ? 'subscribed' : 'not subscribed', $subscription->getFilter()));
+        $this->logger->debug('Subscribed');
 
         return $subscribed;
     }
     
     public function publish(MQTT\Message $message): bool
     {
+        $this->logger->debug('Publish', [
+            'topic' => $message->getTopic(),
+            'payload' => $message->getPayload(),
+            'qos' => $message->getQosLevel()
+        ]);
+
         $flow = new Flow(new MQTT\Flow\OutgoingPublishFlow($this->factory, $message, $this->identifierGenerator), new Promise());
         $this->flows[] = $flow;
         $this->send($flow->start());
         $published = $flow->await(new Promise\Timeout(5.0, false));
-        
+
+        $this->logger->debug('Published');
+
         return $published;
     }
 
     public function send(MQTT\Packet $packet): false|int
     {
+        $this->logger->debug('Packet send', [
+            'packet' => $packet::class
+        ]);
+
         return $this->socket->write($packet->__toString());
     }
 
     private function onPacketReceived(MQTT\Packet $packet): void
     {
-        echo 'Flows: ' . count($this->flows) . PHP_EOL;
+        $this->logger->debug('Packet received', [
+            'packet' => $packet::class,
+            'flows' => count($this->flows)
+        ]);
 
         foreach ($this->flows as $id => $flow) {
             if ($flow->accept($packet)) {
@@ -153,6 +178,8 @@ class Connection
                 foreach ($this->getMessageHandlers() as $handler) {
                     $handler->handleMessage($message);
                 }
+
+                $this->emit('message', [$message]);
 
                 break;
             }
@@ -209,12 +236,16 @@ class Connection
 
     public function close()
     {
+        $this->logger->info('Connection closed');
+
         $this->connected = false;
         $this->flows = [];
         
         if ($this->socket->isConnected()) {
             $this->socket->close();
         }
+
+        $this->emit('end');
     }
     
     public function isConnected(): bool

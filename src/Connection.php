@@ -13,6 +13,7 @@ use inisire\fibers\Scheduler;
 use inisire\mqtt\Contract\MessageHandler;
 use inisire\Protocol\MiIO\Contract\Packet;
 use Psr\Log\LoggerInterface;
+use function inisire\fibers\async;
 
 
 class Connection implements EventEmitterInterface
@@ -59,7 +60,7 @@ class Connection implements EventEmitterInterface
             return false;
         }
 
-        Scheduler::async(function () {
+        async(function () {
             while ($this->socket->isConnected()) {
                 foreach ($this->read() as $packet) {
                     $this->onPacketReceived($packet);
@@ -74,9 +75,9 @@ class Connection implements EventEmitterInterface
         $this->send($flow->start());
         $this->connected = $flow->await(new Promise\Timeout($timeout, false));
 
-        Scheduler::async(function () use ($connection) {
+        async(function () use ($connection) {
             while ($this->isConnected()) {
-                Scheduler::sleep(floor($connection->getKeepAlive() * 0.75));
+                \inisire\fibers\asleep($connection->getKeepAlive() * 0.75);
                 $this->send(new MQTT\Packet\PingRequestPacket());
             }
         });

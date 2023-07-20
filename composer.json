@@ -6,7 +6,8 @@
   "require": {
     "php": ">=8.1",
     "inisire/fibers": "dev-master",
-    "binsoul/net-mqtt": "^0.8"
+    "binsoul/net-mqtt": "^0.8",
+    "evenement/evenement": "^3.0"
   },
   "repositories": [
     {

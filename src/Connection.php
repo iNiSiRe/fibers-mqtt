@@ -3,20 +3,15 @@
 namespace inisire\mqtt;
 
 use BinSoul\Net\Mqtt as MQTT;
-use Evenement\EventEmitterInterface;
 use Evenement\EventEmitterTrait;
-use inisire\fibers\Broadcast;
+use inisire\fibers\Contract\Socket;
 use inisire\fibers\Contract\SocketFactory;
-use inisire\fibers\Network\Socket;
 use inisire\fibers\Promise;
-use inisire\fibers\Scheduler;
-use inisire\mqtt\Contract\MessageHandler;
-use inisire\Protocol\MiIO\Contract\Packet;
 use Psr\Log\LoggerInterface;
 use function inisire\fibers\async;
 
 
-class Connection implements EventEmitterInterface
+class Connection
 {
     use EventEmitterTrait;
 
@@ -29,11 +24,6 @@ class Connection implements EventEmitterInterface
     private bool $connected = false;
 
     private ?Socket $socket = null;
-
-    /**
-     * @var array<MessageHandler>
-     */
-    private array $messageHandlers = [];
 
     /**
      * @var array<MQTT\Flow>
@@ -87,21 +77,6 @@ class Connection implements EventEmitterInterface
         return $this->connected;
     }
 
-    public function registerMessageHandler(MessageHandler $handler): void
-    {
-        $this->messageHandlers[] = $handler;
-    }
-
-    /**
-     * @return iterable<MessageHandler>
-     */
-    public function getMessageHandlers(): iterable
-    {
-        foreach ($this->messageHandlers as $handler) {
-            yield $handler;
-        }
-    }
-    
     public function subscribe(MQTT\Subscription $subscription): bool
     {
         $this->logger->debug('Subscribe', ['filter' => $subscription->getFilter()]);
@@ -134,7 +109,7 @@ class Connection implements EventEmitterInterface
         return $published;
     }
 
-    public function send(MQTT\Packet $packet): false|int
+    private function send(MQTT\Packet $packet): false|int
     {
         $this->logger->debug('Packet send', [
             'packet' => $packet::class
@@ -176,10 +151,6 @@ class Connection implements EventEmitterInterface
                     $packet->isDuplicate()
                 );
 
-                foreach ($this->getMessageHandlers() as $handler) {
-                    $handler->handleMessage($message);
-                }
-
                 $this->emit('message', [$message]);
 
                 break;
@@ -196,7 +167,7 @@ class Connection implements EventEmitterInterface
      *
      * @throws MQTT\Exception\EndOfStreamException
      */
-    public function read(): iterable
+    private function read(): iterable
     {
         $data = $this->socket->read();
 
@@ -252,6 +223,11 @@ class Connection implements EventEmitterInterface
     public function isConnected(): bool
     {
         return $this->connected;
+    }
+
+    public function onMessage(callable $handler): void
+    {
+        $this->on('message', $handler);
     }
 
     public function __destruct()

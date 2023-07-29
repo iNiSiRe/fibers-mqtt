@@ -4,16 +4,21 @@ namespace inisire\mqtt;
 
 use BinSoul\Net\Mqtt as MQTT;
 use Evenement\EventEmitterTrait;
-use inisire\fibers\Contract\Socket;
-use inisire\fibers\Contract\SocketFactory;
+use inisire\fibers\Network\TCP\Socket;
 use inisire\fibers\Promise;
+use Psr\Log\LoggerAwareInterface;
 use Psr\Log\LoggerInterface;
+use Psr\Log\NullLogger;
 use function inisire\fibers\async;
 
 
-class Connection
+class Connection implements LoggerAwareInterface
 {
     use EventEmitterTrait;
+
+    private ?Socket $socket = null;
+
+    private bool $connected = false;
 
     private MQTT\PacketFactory $factory;
 
@@ -21,30 +26,27 @@ class Connection
 
     private MQTT\PacketStream $buffer;
 
-    private bool $connected = false;
-
-    private ?Socket $socket = null;
 
     /**
      * @var array<MQTT\Flow>
      */
     private array $flows = [];
 
-    public function __construct(
-        private readonly LoggerInterface $logger,
-        private readonly SocketFactory $socketFactory
-    )
+    private LoggerInterface $logger;
+
+    public function __construct()
     {
         $this->factory = new MQTT\DefaultPacketFactory();
         $this->buffer = new MQTT\PacketStream();
         $this->identifierGenerator = new MQTT\DefaultIdentifierGenerator();
+        $this->logger = new NullLogger();
     }
 
     public function connect(string $host, int $port = 1883, int $timeout = 5): bool
     {
         $this->logger->debug('Connection: in progress');
 
-        $this->socket = $this->socketFactory->createTCP();
+        $this->socket = new Socket();
 
         if (!$this->socket->connect($host, $port, $timeout)) {
             return false;
@@ -115,7 +117,14 @@ class Connection
             'packet' => $packet::class
         ]);
 
-        return $this->socket->write($packet->__toString());
+        $result = $this->socket->write($packet->__toString());
+
+        if ($result === false) {
+            $this->close();
+            return false;
+        }
+
+        return $result;
     }
 
     private function onPacketReceived(MQTT\Packet $packet): void
@@ -219,6 +228,11 @@ class Connection
 
         $this->emit('end');
     }
+
+    public function onDisconnect(callable $handler): void
+    {
+        $this->on('end', $handler);
+    }
     
     public function isConnected(): bool
     {
@@ -233,5 +247,10 @@ class Connection
     public function __destruct()
     {
         $this->close();
+    }
+
+    public function setLogger(LoggerInterface $logger): void
+    {
+        $this->logger = $logger;
     }
 }

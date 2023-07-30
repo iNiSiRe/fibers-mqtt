@@ -4,6 +4,9 @@ namespace inisire\mqtt;
 
 use BinSoul\Net\Mqtt as MQTT;
 use Evenement\EventEmitterTrait;
+use inisire\fibers\Network\Exception\ConnectionException;
+use inisire\fibers\Network\Exception\Timeout;
+use inisire\fibers\Network\TCP\Connector;
 use inisire\fibers\Network\TCP\Socket;
 use inisire\fibers\Promise;
 use Psr\Log\LoggerAwareInterface;
@@ -26,7 +29,6 @@ class Connection implements LoggerAwareInterface
 
     private MQTT\PacketStream $buffer;
 
-
     /**
      * @var array<MQTT\Flow>
      */
@@ -34,32 +36,31 @@ class Connection implements LoggerAwareInterface
 
     private LoggerInterface $logger;
 
+    private Connector $connector;
+
     public function __construct()
     {
+        echo 'Connection #' . spl_object_hash($this) . ' created' . PHP_EOL;
+
         $this->factory = new MQTT\DefaultPacketFactory();
         $this->buffer = new MQTT\PacketStream();
         $this->identifierGenerator = new MQTT\DefaultIdentifierGenerator();
+        $this->connector = new Connector();
         $this->logger = new NullLogger();
     }
 
-    public function connect(string $host, int $port = 1883, int $timeout = 5): bool
+    public function connect(string $host, int $port = 1883, int $timeout = 10): bool
     {
-        $this->logger->debug('Connection: in progress');
+        $this->logger->debug('MQTT\Connection: connection in progress');
 
-        $this->socket = new Socket();
-
-        if (!$this->socket->connect($host, $port, $timeout)) {
+        try {
+            $this->socket = $this->connector->connect($host, $port, $timeout);
+            $this->socket->onData([$this, 'handleSocketData']);
+            $this->socket->onClose([$this, 'handleClose']);
+        } catch (ConnectionException $exception) {
+            $this->logger->error('MQTT\Connection: socket error', ['code' => $exception->getCode(), 'error' => $exception->getMessage()]);
             return false;
         }
-
-        async(function () {
-            while ($this->socket->isConnected()) {
-                foreach ($this->read() as $packet) {
-                    $this->onPacketReceived($packet);
-                }
-            }
-            $this->close();
-        });
 
         $connection = new MQTT\DefaultConnection();
         $flow = new Flow(new MQTT\Flow\OutgoingConnectFlow($this->factory, $connection, $this->identifierGenerator), new Promise());
@@ -70,13 +71,37 @@ class Connection implements LoggerAwareInterface
         async(function () use ($connection) {
             while ($this->isConnected()) {
                 \inisire\fibers\asleep($connection->getKeepAlive() * 0.75);
-                $this->send(new MQTT\Packet\PingRequestPacket());
+
+                $flow = new Flow(new MQTT\Flow\OutgoingPingFlow($this->factory), new Promise());
+                $this->flows[] = $flow;
+                $this->send($flow->start());
+
+                $success = $flow->await(new Promise\Timeout(5.0, false));
+
+                if ($success === false) {
+                    $this->close();
+                    break;
+                }
             }
         });
 
-        $this->logger->debug(sprintf('Connection: %s', $this->connected ? 'connected' : 'not connected'));
+        $this->logger->debug(sprintf('MQTT\Connection: %s', $this->connected ? 'connected' : 'not connected'));
+
+        if ($this->connected) {
+            $this->emit('connected');
+        }
 
         return $this->connected;
+    }
+
+    public function handleClose(): void
+    {
+        $this->close();
+    }
+
+    public function onConnected(callable $handler): void
+    {
+        $this->on('connected', $handler);
     }
 
     public function subscribe(MQTT\Subscription $subscription): bool
@@ -117,9 +142,10 @@ class Connection implements LoggerAwareInterface
             'packet' => $packet::class
         ]);
 
-        $result = $this->socket->write($packet->__toString());
-
-        if ($result === false) {
+        try {
+            $result = $this->socket->write($packet->__toString());
+        } catch (ConnectionException $exception) {
+            $this->logger->error('MQTT\Connection: socket write error', ['code' => $exception->getCode(), 'error' => $exception->getMessage()]);
             $this->close();
             return false;
         }
@@ -172,18 +198,10 @@ class Connection implements LoggerAwareInterface
     }
 
     /**
-     * @return iterable<MQTT\Packet>
-     *
      * @throws MQTT\Exception\EndOfStreamException
      */
-    private function read(): iterable
+    public function handleSocketData(string $data): void
     {
-        $data = $this->socket->read();
-
-        if (!$data) {
-            return [];
-        }
-
         $this->buffer->write($data);
 
         while ($this->buffer->getRemainingBytes() > 0) {
@@ -202,14 +220,12 @@ class Connection implements LoggerAwareInterface
             try {
                 $packet->read($this->buffer);
                 $this->buffer->cut();
-                yield $packet;
+                $this->onPacketReceived($packet);
             } catch (MQTT\Exception\EndOfStreamException $e) {
                 $this->buffer->setPosition($position);
-                $packet = null;
                 break;
             } catch (MQTT\Exception\MalformedPacketException $e) {
                 $this->logger->error($e->getMessage());
-                $packet = null;
                 continue;
             }
         }
@@ -217,21 +233,23 @@ class Connection implements LoggerAwareInterface
 
     public function close()
     {
-        $this->logger->info('Connection closed');
-
-        $this->connected = false;
-        $this->flows = [];
-        
-        if ($this->socket->isConnected()) {
-            $this->socket->close();
+        if (!$this->connected) {
+            return;
         }
 
-        $this->emit('end');
+        $this->connected = false;
+        $this->socket?->close();
+        $this->flows = [];
+
+        $this->logger->info('Connection closed');
+
+        $this->emit('close');
+        $this->removeAllListeners();
     }
 
     public function onDisconnect(callable $handler): void
     {
-        $this->on('end', $handler);
+        $this->on('close', $handler);
     }
     
     public function isConnected(): bool
@@ -239,14 +257,14 @@ class Connection implements LoggerAwareInterface
         return $this->connected;
     }
 
+    public function __destruct()
+    {
+        echo 'Connection #' . spl_object_hash($this) . ' destroyed' . PHP_EOL;
+    }
+
     public function onMessage(callable $handler): void
     {
         $this->on('message', $handler);
-    }
-
-    public function __destruct()
-    {
-        $this->close();
     }
 
     public function setLogger(LoggerInterface $logger): void
